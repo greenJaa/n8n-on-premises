@@ -70,47 +70,64 @@ resource "aws_instance" "n8n" {
 
 user_data = <<-EOF
               #!/bin/bash
-              # 1. Update and install Docker + Compose Plugin
+              # 1. IMMEDIATE MEMORY FIX (Crucial for t3.micro)
+              sudo fallocate -l 2G /swapfile
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+              sudo swapon /swapfile
+              echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+              # 2. INSTALL DOCKER
               sudo apt-get update
               sudo apt-get install -y docker.io docker-compose-v2
-              
-              # 2. Ensure Docker starts on boot
               sudo systemctl enable docker
               sudo systemctl start docker
               
-              # 3. Setup n8n directory with correct permissions
               mkdir -p /home/ubuntu/n8n/n8n_data
-              # Crucial: Give ownership to the 'node' user (UID 1000) used by n8n container
               sudo chown -R 1000:1000 /home/ubuntu/n8n/n8n_data
-              
               cd /home/ubuntu/n8n
-              
-              # 4. Create the config
+
+              # 3. CREATE DOCKER COMPOSE
               cat <<EOD > docker-compose.yml
-              version: "3.8"
               services:
                 n8n:
                   image: n8nio/n8n:latest
                   restart: unless-stopped
-                  ports:
-                    - "5678:5678"
                   environment:
                     - N8N_PORT=5678
-                    - GENERIC_TIMEZONE=UTC
                     - DB_TYPE=sqlite
-                    - N8N_SECURE_COOKIE=false
+                    - WEBHOOK_URL=$${DYNAMIC_URL}  # This gets replaced by the script below
+                    - EXECUTIONS_DATA_PRUNE=true
+                    - EXECUTIONS_DATA_MAX_AGE=72
                   volumes:
                     - ./n8n_data:/home/node/.n8n
+
+                tunnel:
+                  image: cloudflare/cloudflared:latest
+                  restart: unless-stopped
+                  command: tunnel --no-autoupdate --url http://n8n:5678
               EOD
+
+              # 4. START TUNNEL FIRST TO GET THE URL
+              sudo docker compose up -d tunnel
               
-              # 5. Start n8n
-              sudo docker compose up -d
-              EOF
+              # Wait for Cloudflare to assign the random URL
+              sleep 15
+              NEW_URL=$(sudo docker logs n8n-tunnel-1 2>&1 | grep -o 'https://.*trycloudflare.com' | head -n 1)
+              
+              # Save the URL to a file so we can see it later
+              echo \$NEW_URL > /home/ubuntu/n8n/url.txt
+
+              # 5. START N8N WITH THE DETECTED URL
+              DYNAMIC_URL=\$NEW_URL sudo -E docker compose up -d n8n
+            EOF
   tags = {
     Name = "n8n-server"
   }
 }
+
 # --- IAM Role for Lambda ---
+
 resource "aws_iam_role" "lambda_ec2_role" {
   name = "lambda-ec2-role"
   assume_role_policy = jsonencode({
