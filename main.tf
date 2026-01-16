@@ -61,33 +61,43 @@ resource "aws_security_group" "n8n_sg" {
   }
 }
 
-# --- EC2 Instance ---
+# ... (Keep your existing provider and data source blocks) ...
+
 resource "aws_instance" "n8n" {
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = "t3.micro"
   key_name               = aws_key_pair.n8n_key.key_name
   vpc_security_group_ids = [aws_security_group.n8n_sg.id]
 
-user_data = <<-EOF
-              #!/bin/bash
-              # 1. IMMEDIATE MEMORY FIX (Crucial for t3.micro)
-              sudo fallocate -l 2G /swapfile
-              sudo chmod 600 /swapfile
-              sudo mkswap /swapfile
-              sudo swapon /swapfile
-              echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+  # 1. AUTOMATIC DISK UPGRADE (20GB is safe and free-tier eligible)
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+  }
 
-              # 2. INSTALL DOCKER
+  user_data = <<-EOF
+              #!/bin/bash
+              # 2. AUTO-RESIZE PARTITION (Ensures Linux sees all 20GB)
+              sudo growpart /dev/nvme0n1 1 || sudo growpart /dev/xvda 1
+              sudo resize2fs /dev/nvme0n1p1 || sudo resize2fs /dev/xvda1
+
+              # 3. MEMORY PROTECTION (2GB Swap)
+              if [ ! -f /swapfile ]; then
+                sudo fallocate -l 2G /swapfile
+                sudo chmod 600 /swapfile
+                sudo mkswap /swapfile
+                sudo swapon /swapfile
+                echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+              fi
+
+              # 4. DOCKER & N8N INSTALLATION
               sudo apt-get update
               sudo apt-get install -y docker.io docker-compose-v2
-              sudo systemctl enable docker
-              sudo systemctl start docker
               
               mkdir -p /home/ubuntu/n8n/n8n_data
               sudo chown -R 1000:1000 /home/ubuntu/n8n/n8n_data
               cd /home/ubuntu/n8n
 
-              # 3. CREATE DOCKER COMPOSE
               cat <<EOD > docker-compose.yml
               services:
                 n8n:
@@ -96,35 +106,26 @@ user_data = <<-EOF
                   environment:
                     - N8N_PORT=5678
                     - DB_TYPE=sqlite
-                    - WEBHOOK_URL=$${DYNAMIC_URL}  # This gets replaced by the script below
-                    - EXECUTIONS_DATA_PRUNE=true
-                    - EXECUTIONS_DATA_MAX_AGE=72
+                    - WEBHOOK_URL=\$${DYNAMIC_URL}
                   volumes:
                     - ./n8n_data:/home/node/.n8n
-
                 tunnel:
                   image: cloudflare/cloudflared:latest
                   restart: unless-stopped
                   command: tunnel --no-autoupdate --url http://n8n:5678
               EOD
 
-              # 4. START TUNNEL FIRST TO GET THE URL
               sudo docker compose up -d tunnel
-              
-              # Wait for Cloudflare to assign the random URL
-              sleep 15
+              sleep 20
               NEW_URL=$(sudo docker logs n8n-tunnel-1 2>&1 | grep -o 'https://.*trycloudflare.com' | head -n 1)
-              
-              # Save the URL to a file so we can see it later
               echo \$NEW_URL > /home/ubuntu/n8n/url.txt
-
-              # 5. START N8N WITH THE DETECTED URL
               DYNAMIC_URL=\$NEW_URL sudo -E docker compose up -d n8n
             EOF
-  tags = {
-    Name = "n8n-server"
-  }
+
+  tags = { Name = "n8n-server" }
 }
+
+# ... (Keep the rest of your IAM, Lambda, and Output blocks) ...
 
 # --- IAM Role for Lambda ---
 
