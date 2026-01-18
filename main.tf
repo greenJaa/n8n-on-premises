@@ -106,9 +106,12 @@ resource "aws_instance" "n8n" {
                   environment:
                     - N8N_PORT=5678
                     - DB_TYPE=sqlite
-                    - WEBHOOK_URL=\$${DYNAMIC_URL}
+                    - WEBHOOK_URL=$${DYNAMIC_URL}
+                    - NODES_EXCLUDE=[]  # <--- ADD THIS LINE TO ENABLE THE NODE
+                    - N8N_PUSH_BACKEND=sse
                   volumes:
                     - ./n8n_data:/home/node/.n8n
+                
                 tunnel:
                   image: cloudflare/cloudflared:latest
                   restart: unless-stopped

@@ -4,44 +4,30 @@ RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-get_ip() {
-    terraform output -raw ec2_public_ip 2>/dev/null
-}
+get_ip() { terraform output -raw ec2_public_ip 2>/dev/null; }
 
-show_health() {
+reset_n8n() {
     local ip=$(get_ip)
-    if [ -z "$ip" ] || [[ "$ip" == *"No outputs"* ]]; then echo -e "${RED}No IP found.${NC}"; return; fi
-    echo -e "${BLUE}Checking RAM and Disk on $ip...${NC}"
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@$ip "echo '--- MEMORY ---' && free -h && echo '' && echo '--- DISK ---' && df -h /"
+    echo -e "${RED}WARNING: This will delete ALL workflows and reset your password!${NC}"
+    read -p "Are you sure? (y/n): " confirm
+    if [[ "$confirm" == "y" ]]; then
+        ssh -i ~/.ssh/id_rsa ubuntu@$ip "sudo docker stop n8n-n8n-1 && sudo rm -rf /home/ubuntu/n8n/n8n_data/* && sudo docker start n8n-n8n-1"
+        echo -e "${GREEN}n8n has been reset. Use Option 5 to get a fresh URL.${NC}"
+    fi
 }
 
 show_url() {
     local ip=$(get_ip)
-    if [ -z "$ip" ] || [[ "$ip" == *"No outputs"* ]]; then echo -e "${RED}No IP found.${NC}"; return; fi
-    echo -e "${BLUE}Fetching URL from $ip...${NC}"
-    URL=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@$ip "sudo docker logs --tail 50 n8n-tunnel-1 2>&1 | grep 'https://' | grep 'trycloudflare.com' | grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' | tail -n 1")
-    if [ -z "$URL" ]; then
-        echo -e "${RED}URL not found yet. Wait 30s and try again.${NC}"
-    else
-        echo -e "${GREEN}URL: $URL${NC}"
-    fi
+    echo -e "${BLUE}Fetching current URL...${NC}"
+    URL=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@$ip "sudo docker logs --tail 50 n8n-tunnel-1 2>&1 | grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' | tail -n 1")
+    echo -e "${GREEN}URL: $URL${NC}"
 }
 
-start_server() {
-    local trigger=$(terraform output -raw trigger_url)
-    echo -e "${BLUE}Starting via API...${NC}"
-    until curl -s -X POST "$trigger" | grep -qE "starting|running"; do 
-        echo "Waiting for start signal..."
-        sleep 5
-    done
-    echo -e "${GREEN}Started! Waiting 45s for services...${NC}"
-    sleep 45 && show_url
-}
-
-stop_server() {
-    local stop=$(terraform output -raw stop_url)
-    curl -s -X POST "$stop"
-    echo -e "${RED}Stop signal sent.${NC}"
+refresh_url() {
+    local ip=$(get_ip)
+    echo -e "${BLUE}Restarting Tunnel for new URL...${NC}"
+    ssh -i ~/.ssh/id_rsa ubuntu@$ip "sudo docker restart n8n-tunnel-1"
+    sleep 15 && show_url
 }
 
 while true; do
@@ -51,14 +37,17 @@ while true; do
     echo "2) Stop Server"
     echo "3) Get URL"
     echo "4) Check Health (RAM/Disk)"
-    echo "5) Exit"
+    echo "5) Refresh Tunnel (New URL)"
+    echo "6) RESET n8n (Forgot Password)"
+    echo "7) Exit"
     read -p "Selection: " choice
     case $choice in
-        1) start_server ;;
-        2) stop_server ;;
+        1) curl -s -X POST $(terraform output -raw trigger_url) ;;
+        2) curl -s -X POST $(terraform output -raw stop_url) ;;
         3) show_url ;;
-        4) show_health ;;
-        5) exit 0 ;;
-        *) echo "Invalid choice." ;;
+        4) ssh -i ~/.ssh/id_rsa ubuntu@$IP "free -h && df -h /" ;;
+        5) refresh_url ;;
+        6) reset_n8n ;;
+        7) exit 0 ;;
     esac
 done
