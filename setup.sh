@@ -50,20 +50,32 @@ EOD
 # Using --compatibility ensures the 'deploy' memory limits work
 docker compose --compatibility up -d tunnel
 
-# 6. URL Discovery Loop
-echo "Waiting for Cloudflare URL..."
-for i in {1..15}; do
+# ... (Keep steps 1 through 5 the same) ...
+
+# 6. URL Discovery Loop (The "Patience" Patch)
+echo "Waiting for the Secret Map (Cloudflare URL)..."
+# We increased this from 15 to 40 so the 'Small Pony' server has time to finish
+for i in {1..40}; do
+  # This command looks inside the tunnel's diary to find the new link
   NEW_URL=$(docker logs n8n-tunnel 2>&1 | grep -o 'https://.*trycloudflare.com' | head -n 1)
+  
   if [ ! -z "$NEW_URL" ]; then
+    echo "Found it! The Castle is at: $NEW_URL"
     break
   fi
+  echo "Still looking... (Try $i of 40)"
   sleep 4
 done
 
-# 7. Finalize n8n
-echo "$NEW_URL" > /home/ubuntu/n8n/url.txt
-export WEBHOOK_URL="$NEW_URL"
-docker compose --compatibility up -d n8n
+# 7. Finalize n8n (The "Marker" Step)
+if [ ! -z "$NEW_URL" ]; then
+  echo "$NEW_URL" > /home/ubuntu/n8n/url.txt
+  export WEBHOOK_URL="$NEW_URL"
+  # Now we start the n8n brain with the right map!
+  docker compose --compatibility up -d n8n
+else
+  echo "Oh no! The Robot couldn't find the URL in time. Try running Option 5 again."
+fi
 
 # Final permission sweep
 chown -R ubuntu:ubuntu /home/ubuntu/n8n
