@@ -11,9 +11,7 @@ provider "aws" {
   region = var.aws_region
 }
 
-# --- 1. Custom VPC Infrastructure ---
-# Replacing the "Default VPC" data source which was failing
-
+# --- 1. Infrastructure ---
 resource "aws_vpc" "n8n_vpc" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -22,14 +20,12 @@ resource "aws_vpc" "n8n_vpc" {
 
 resource "aws_internet_gateway" "n8n_igw" {
   vpc_id = aws_vpc.n8n_vpc.id
-  tags   = { Name = "n8n-igw" }
 }
 
 resource "aws_subnet" "n8n_subnet" {
   vpc_id                  = aws_vpc.n8n_vpc.id
   cidr_block              = "10.0.1.0/24"
   map_public_ip_on_launch = true
-  tags                    = { Name = "n8n-public-subnet" }
 }
 
 resource "aws_route_table" "n8n_rt" {
@@ -45,22 +41,15 @@ resource "aws_route_table_association" "n8n_rta" {
   route_table_id = aws_route_table.n8n_rt.id
 }
 
-# --- 2. Data Sources ---
-
+# --- 2. Security & EC2 ---
 data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["099720109477"] # Canonical
+  owners      = ["099720109477"]
   filter {
     name   = "name"
     values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
 }
-
-# --- 3. Compute & Security ---
 
 resource "aws_key_pair" "n8n_key" {
   key_name   = "n8n-key"
@@ -69,14 +58,14 @@ resource "aws_key_pair" "n8n_key" {
 
 resource "aws_security_group" "n8n_sg" {
   name        = "n8n-sg"
-  vpc_id      = aws_vpc.n8n_vpc.id # Updated to use Custom VPC
   description = "Allow SSH and n8n ports"
+  vpc_id      = aws_vpc.n8n_vpc.id
 
   ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] 
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
@@ -99,59 +88,19 @@ resource "aws_instance" "n8n" {
   instance_type          = "t3.micro"
   key_name               = aws_key_pair.n8n_key.key_name
   vpc_security_group_ids = [aws_security_group.n8n_sg.id]
-  subnet_id              = aws_subnet.n8n_subnet.id # Explicitly set subnet
+  subnet_id              = aws_subnet.n8n_subnet.id
+
+  user_data = file("${path.module}/setup.sh")
 
   root_block_device {
     volume_size = 20
     volume_type = "gp3"
   }
-
-  user_data = <<-EOF
-              #!/bin/bash
-              sudo growpart /dev/nvme0n1 1 || sudo growpart /dev/xvda 1
-              sudo resize2fs /dev/nvme0n1p1 || sudo resize2fs /dev/xvda1
-              if [ ! -f /swapfile ]; then
-                sudo fallocate -l 2G /swapfile
-                sudo chmod 600 /swapfile
-                sudo mkswap /swapfile
-                sudo swapon /swapfile
-                echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-              fi
-              sudo apt-get update
-              sudo apt-get install -y docker.io docker-compose-v2
-              mkdir -p /home/ubuntu/n8n/n8n_data
-              sudo chown -R 1000:1000 /home/ubuntu/n8n/n8n_data
-              cd /home/ubuntu/n8n
-              cat <<EOD > docker-compose.yml
-              services:
-                n8n:
-                  image: n8nio/n8n:latest
-                  restart: unless-stopped
-                  environment:
-                    - N8N_PORT=5678
-                    - DB_TYPE=sqlite
-                    - WEBHOOK_URL=\$${DYNAMIC_URL}
-                    - NODES_EXCLUDE=[]
-                    - N8N_PUSH_BACKEND=sse
-                  volumes:
-                    - ./n8n_data:/home/node/.n8n
-                tunnel:
-                  image: cloudflare/cloudflared:latest
-                  restart: unless-stopped
-                  command: tunnel --no-autoupdate --url http://n8n:5678
-              EOD
-              sudo docker compose up -d tunnel
-              sleep 20
-              NEW_URL=$(sudo docker logs n8n-tunnel-1 2>&1 | grep -o 'https://.*trycloudflare.com' | head -n 1)
-              echo \$NEW_URL > /home/ubuntu/n8n/url.txt
-              DYNAMIC_URL=\$NEW_URL sudo -E docker compose up -d n8n
-            EOF
-
+  
   tags = { Name = "n8n-server" }
 }
 
-# --- 4. IAM Role for Lambda ---
-
+# --- 3. IAM & Lambda ---
 resource "aws_iam_role" "lambda_ec2_role" {
   name = "lambda-ec2-role"
   assume_role_policy = jsonencode({
@@ -183,8 +132,6 @@ resource "aws_iam_role_policy" "lambda_ec2_policy" {
     ]
   })
 }
-
-# --- 5. Lambda Functions ---
 
 data "archive_file" "start_lambda" {
   type        = "zip"
@@ -220,12 +167,12 @@ resource "aws_lambda_function" "stop_ec2" {
   }
 }
 
-# --- 6. API Gateway & Triggers ---
-
+# --- 4. API Gateway (Fixed Resources) ---
 resource "aws_api_gateway_rest_api" "n8n_trigger" {
   name = "n8n-trigger-api"
 }
 
+# Start Resource
 resource "aws_api_gateway_resource" "start" {
   rest_api_id = aws_api_gateway_rest_api.n8n_trigger.id
   parent_id   = aws_api_gateway_rest_api.n8n_trigger.root_resource_id
@@ -248,6 +195,7 @@ resource "aws_api_gateway_integration" "start_post_lambda" {
   uri                     = aws_lambda_function.start_ec2.invoke_arn
 }
 
+# Stop Resource
 resource "aws_api_gateway_resource" "stop" {
   rest_api_id = aws_api_gateway_rest_api.n8n_trigger.id
   parent_id   = aws_api_gateway_rest_api.n8n_trigger.root_resource_id
@@ -270,9 +218,14 @@ resource "aws_api_gateway_integration" "stop_post_lambda" {
   uri                     = aws_lambda_function.stop_ec2.invoke_arn
 }
 
+# Deployment and Stage (Fixing Deprecation and Cycles)
 resource "aws_api_gateway_deployment" "n8n_deploy" {
-  depends_on = [aws_api_gateway_integration.start_post_lambda, aws_api_gateway_integration.stop_post_lambda]
+  depends_on = [
+    aws_api_gateway_integration.start_post_lambda,
+    aws_api_gateway_integration.stop_post_lambda
+  ]
   rest_api_id = aws_api_gateway_rest_api.n8n_trigger.id
+
   triggers = {
     redeployment = sha1(jsonencode([
       aws_api_gateway_resource.start.id,
@@ -281,7 +234,10 @@ resource "aws_api_gateway_deployment" "n8n_deploy" {
       aws_api_gateway_method.stop_post.id,
     ]))
   }
-  lifecycle { create_before_destroy = true }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_api_gateway_stage" "prod" {
@@ -290,8 +246,7 @@ resource "aws_api_gateway_stage" "prod" {
   stage_name    = "prod"
 }
 
-# --- 7. Permissions ---
-
+# --- 5. Permissions ---
 resource "aws_lambda_permission" "apigw_start" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.start_ec2.function_name
@@ -306,9 +261,3 @@ resource "aws_lambda_permission" "apigw_stop" {
   source_arn    = "${aws_api_gateway_rest_api.n8n_trigger.execution_arn}/*/*"
 }
 
-# --- 8. Outputs ---
-
-output "ec2_public_ip" { value = aws_instance.n8n.public_ip }
-output "n8n_url"      { value = "http://${aws_instance.n8n.public_ip}:5678" }
-output "trigger_url"  { value = "${aws_api_gateway_stage.prod.invoke_url}/start" }
-output "stop_url"     { value = "${aws_api_gateway_stage.prod.invoke_url}/stop" }
